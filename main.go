@@ -308,8 +308,11 @@ func main() {
 	}
 
 	wg.Wait()
-	time.Sleep(time.Duration(*delay) * time.Millisecond) // Wait for the last log messages
+	logCh <- fmt.Sprintf("Connection %d: Manifest request from %s (%s) in %s using %s completed with status: %d",
+		123, "yay", "127.0.0.1", "aws-us-east-1", "ignorethis", 200)
+	time.Sleep(time.Duration(*delay)*time.Millisecond + time.Duration(*jitter)*time.Millisecond)
 	ticker.Stop()
+
 	close(logCh)
 
 	duration := time.Since(startTime)
