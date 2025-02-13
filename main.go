@@ -190,7 +190,8 @@ func main() {
 		imageName    = flag.String("image", "", "Docker image name (e.g., nginx:latest or ghcr.io/username/repo:tag)")
 		numPulls     = flag.Int("pulls", 1, "Number of pulls to simulate")
 		registryName = flag.String("registry", "dockerhub", "Registry to use (dockerhub, ghcr)")
-		delay        = flag.Int("delay", 50, "Delay between requests in milliseconds")
+		delay        = flag.Int("delay", 50, "Base delay between requests in milliseconds")
+		jitter       = flag.Float64("jitter", 0.0, "Jitter factor for randomizing delays (0.0-100.0)")
 		concurrent   = flag.Int("concurrent", 5, "Number of concurrent requests")
 	)
 	flag.Parse()
@@ -208,8 +209,17 @@ func main() {
 		return
 	}
 
+	// Validate jitter value
+	if *jitter < 0.0 || *jitter > 100.0 {
+		fmt.Println("Error: jitter must be between 0.0 and 100.0")
+		return
+	}
+
 	fmt.Printf("Starting %d manifest requests for %s from %s\n",
 		*numPulls, *imageName, registry.Name)
+	if *jitter > 0 {
+		fmt.Printf("Using base delay of %dms with jitter factor of %.1f\n", *delay, *jitter)
+	}
 
 	semaphore := make(chan struct{}, *concurrent)
 	var wg sync.WaitGroup
@@ -247,7 +257,20 @@ func main() {
 			<-semaphore
 		}(i + 1)
 
-		time.Sleep(time.Duration(*delay) * time.Millisecond)
+		// Calculate jittered delay
+		sleepTime := time.Duration(*delay) * time.Millisecond
+		if *jitter > 0 {
+			jitterRange := float64(*delay) * *jitter
+			jitterMs := rand.Float64() * jitterRange
+			// Apply jitter (either adding or subtracting from base delay)
+			jitterOffset := int(jitterMs) - int(jitterRange/2)
+			sleepTime = time.Duration(*delay+jitterOffset) * time.Millisecond
+			if sleepTime < 0 {
+				sleepTime = 0
+			}
+		}
+
+		time.Sleep(sleepTime)
 	}
 
 	wg.Wait()
