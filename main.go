@@ -55,26 +55,54 @@ var userAgents = []string{
 
 // IP prefixes for fake client IPs
 var ipPrefixes = []string{
-	"192.168.", "10.0.", "172.16.", "176.32.",
-	"52.94.", "34.198.", "13.107.", "104.16.",
+	"10.0.", "10.1.", "172.16.", "172.17.",
+	"192.168.0.", "192.168.1.", "172.20.", "172.30.",
+}
+
+var geoRegions = []string{
+	"us-east", "us-west", "eu-central", "eu-west",
+	"ap-south", "ap-northeast", "sa-east",
 }
 
 func getRandomUserAgent() string {
-	return userAgents[rand.Intn(len(userAgents))]
+	base := userAgents[rand.Intn(len(userAgents))]
+	// Add minor version variability for more realism
+	if strings.HasPrefix(base, "docker/") {
+		parts := strings.Split(base, "/")
+		version := parts[1]
+		vParts := strings.Split(version, ".")
+		if len(vParts) > 2 {
+			minorVer := rand.Intn(15)
+			return fmt.Sprintf("docker/%s.%s.%d", vParts[0], vParts[1], minorVer)
+		}
+	}
+	return base
 }
 
 func getRandomIP() string {
 	prefix := ipPrefixes[rand.Intn(len(ipPrefixes))]
+	if strings.Count(prefix, ".") == 2 {
+		return fmt.Sprintf("%s%d", prefix, rand.Intn(256))
+	}
 	return fmt.Sprintf("%s%d.%d", prefix, rand.Intn(256), rand.Intn(256))
 }
 
 func getRandomHost() string {
-	hosts := []string{
-		"worker-node", "runner", "builder", "ci-agent",
-		"deployment", "kubernetes", "docker-host", "jenkins-agent",
+	domains := []string{
+		"internal.corp", "k8s.local", "docker.local", "ci.internal",
+		"build.local", "runner.cicd", "node.cluster", "agent.pool",
 	}
-	prefix := hosts[rand.Intn(len(hosts))]
-	return fmt.Sprintf("%s-%d.example.com", prefix, rand.Intn(1000))
+	prefixes := []string{
+		"worker", "runner", "builder", "ci-agent",
+		"deployment", "node", "docker", "jenkins",
+	}
+	prefix := prefixes[rand.Intn(len(prefixes))]
+	domain := domains[rand.Intn(len(domains))]
+	return fmt.Sprintf("%s-%03d.%s", prefix, rand.Intn(1000), domain)
+}
+
+func getRandomRegion() string {
+	return geoRegions[rand.Intn(len(geoRegions))]
 }
 
 func getToken(registry Registry, repository string) (string, error) {
@@ -144,6 +172,7 @@ func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *s
 	clientIP := getRandomIP()
 	clientHost := getRandomHost()
 	userAgent := getRandomUserAgent()
+	region := getRandomRegion()
 
 	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -151,6 +180,10 @@ func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *s
 	req.Header.Set("X-Forwarded-For", clientIP)
 	req.Header.Set("X-Real-IP", clientIP)
 	req.Header.Set("Host", strings.TrimPrefix(registry.RegistryURL, "https://"))
+	req.Header.Set("X-Forwarded-Host", strings.TrimPrefix(registry.RegistryURL, "https://"))
+	req.Header.Set("X-Request-ID", fmt.Sprintf("%x", rand.Int63()))
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("CloudFront-Viewer-Country", region)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -161,8 +194,8 @@ func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *s
 	defer resp.Body.Close()
 
 	if connID%50 == 0 {
-		logCh <- fmt.Sprintf("Connection %d: Manifest request from %s (%s) using %s completed with status: %d",
-			connID, clientHost, clientIP, userAgent, resp.StatusCode)
+		logCh <- fmt.Sprintf("Connection %d: Manifest request from %s (%s) in %s using %s completed with status: %d",
+			connID, clientHost, clientIP, region, userAgent, resp.StatusCode)
 	}
 
 	atomic.AddInt64(counter, 1)
@@ -218,7 +251,7 @@ func main() {
 	fmt.Printf("Starting %d manifest requests for %s from %s\n",
 		*numPulls, *imageName, registry.Name)
 	if *jitter > 0 {
-		fmt.Printf("Using base delay of %dms with jitter factor of %.1f\n", *delay, *jitter)
+		fmt.Printf("Using base delay of %dms with jitter factor of %.1f%%\n", *delay, *jitter)
 	}
 
 	semaphore := make(chan struct{}, *concurrent)
@@ -258,19 +291,20 @@ func main() {
 		}(i + 1)
 
 		// Calculate jittered delay
-		sleepTime := time.Duration(*delay) * time.Millisecond
 		if *jitter > 0 {
-			jitterRange := float64(*delay) * *jitter
-			jitterMs := rand.Float64() * jitterRange
-			// Apply jitter (either adding or subtracting from base delay)
-			jitterOffset := int(jitterMs) - int(jitterRange/2)
-			sleepTime = time.Duration(*delay+jitterOffset) * time.Millisecond
+			jitterFactor := *jitter / 100.0
+			baseDelay := float64(*delay)
+			jitterAmount := baseDelay * jitterFactor
+			randomJitter := (rand.Float64()*2 - 1) * jitterAmount // Between -jitterAmount and +jitterAmount
+			finalDelay := baseDelay + randomJitter
+			sleepTime := time.Duration(int(finalDelay)) * time.Millisecond
 			if sleepTime < 0 {
 				sleepTime = 0
 			}
+			time.Sleep(sleepTime)
+		} else {
+			time.Sleep(time.Duration(*delay) * time.Millisecond)
 		}
-
-		time.Sleep(sleepTime)
 	}
 
 	wg.Wait()
