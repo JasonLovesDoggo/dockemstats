@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +41,42 @@ var registryConfigs = map[string]Registry{
 	},
 }
 
+// User agents list
+var userAgents = []string{
+	"docker/24.0.6",
+	"docker/23.0.3",
+	"docker/20.10.22",
+	"docker/19.03.13",
+	"containerd/1.6.19",
+	"containerd/1.5.13",
+	"podman/4.4.1",
+	"buildkit/0.11.6",
+}
+
+// IP prefixes for fake client IPs
+var ipPrefixes = []string{
+	"192.168.", "10.0.", "172.16.", "176.32.",
+	"52.94.", "34.198.", "13.107.", "104.16.",
+}
+
+func getRandomUserAgent() string {
+	return userAgents[rand.Intn(len(userAgents))]
+}
+
+func getRandomIP() string {
+	prefix := ipPrefixes[rand.Intn(len(ipPrefixes))]
+	return fmt.Sprintf("%s%d.%d", prefix, rand.Intn(256), rand.Intn(256))
+}
+
+func getRandomHost() string {
+	hosts := []string{
+		"worker-node", "runner", "builder", "ci-agent",
+		"deployment", "kubernetes", "docker-host", "jenkins-agent",
+	}
+	prefix := hosts[rand.Intn(len(hosts))]
+	return fmt.Sprintf("%s-%d.example.com", prefix, rand.Intn(1000))
+}
+
 func getToken(registry Registry, repository string) (string, error) {
 	url := fmt.Sprintf("%s?service=%s&scope=repository:%s:pull", registry.AuthURL, registry.Service, repository)
 
@@ -64,7 +102,7 @@ func getToken(registry Registry, repository string) (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
-func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *sync.WaitGroup) {
+func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *sync.WaitGroup, counter *int64, logCh chan<- string) {
 	defer wg.Done()
 
 	// Parse image name and tag
@@ -87,11 +125,10 @@ func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *s
 		repository = strings.TrimPrefix(repository, "ghcr.io/")
 	}
 
-	fmt.Printf("Connection %d: Getting token for %s from %s\n", connID, repository, registry.Name)
-
+	// Get auth token
 	token, err := getToken(registry, repository)
 	if err != nil {
-		fmt.Printf("Connection %d: Failed to get token: %v\n", connID, err)
+		logCh <- fmt.Sprintf("Connection %d: Failed to get token: %v", connID, err)
 		return
 	}
 
@@ -99,36 +136,62 @@ func simulateManifestPull(registry Registry, imageSpec string, connID int, wg *s
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Printf("Connection %d: Error creating request: %v\n", connID, err)
+		logCh <- fmt.Sprintf("Connection %d: Error creating request: %v", connID, err)
 		return
 	}
 
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	// Add realistic headers
+	clientIP := getRandomIP()
+	clientHost := getRandomHost()
+	userAgent := getRandomUserAgent()
 
-	fmt.Printf("Connection %d: Requesting manifest for %s:%s from %s\n", connID, repository, tag, registry.Name)
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("X-Forwarded-For", clientIP)
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("Host", strings.TrimPrefix(registry.RegistryURL, "https://"))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Connection %d: Error requesting manifest: %v\n", connID, err)
+		logCh <- fmt.Sprintf("Connection %d: Error requesting manifest: %v", connID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		fmt.Printf("Connection %d: Successfully requested manifest (Status: %d)\n", connID, resp.StatusCode)
-	} else {
-		fmt.Printf("Connection %d: Failed to request manifest (Status: %d)\n", connID, resp.StatusCode)
+	if connID%50 == 0 {
+		logCh <- fmt.Sprintf("Connection %d: Manifest request from %s (%s) using %s completed with status: %d",
+			connID, clientHost, clientIP, userAgent, resp.StatusCode)
 	}
+
+	atomic.AddInt64(counter, 1)
+}
+
+func renderProgressBar(done int64, total int, width int) string {
+	percentage := float64(done) / float64(total)
+	completedWidth := int(float64(width) * percentage)
+
+	bar := "["
+	for i := 0; i < width; i++ {
+		if i < completedWidth {
+			bar += "="
+		} else {
+			bar += " "
+		}
+	}
+	bar += "]"
+
+	return fmt.Sprintf("%s %.1f%% (%d/%d)", bar, percentage*100, done, total)
 }
 
 func main() {
 	var (
 		imageName    = flag.String("image", "", "Docker image name (e.g., nginx:latest or ghcr.io/username/repo:tag)")
-		numPulls     = flag.Int("pulls", 1, "Number of parallel pulls to simulate")
+		numPulls     = flag.Int("pulls", 1, "Number of pulls to simulate")
 		registryName = flag.String("registry", "dockerhub", "Registry to use (dockerhub, ghcr)")
-		delay        = flag.Int("delay", 100, "Delay between requests in milliseconds")
+		delay        = flag.Int("delay", 50, "Delay between requests in milliseconds")
+		concurrent   = flag.Int("concurrent", 5, "Number of concurrent requests")
 	)
 	flag.Parse()
 
@@ -145,20 +208,59 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Starting %d parallel manifest requests for %s from %s\n",
+	fmt.Printf("Starting %d manifest requests for %s from %s\n",
 		*numPulls, *imageName, registry.Name)
 
+	semaphore := make(chan struct{}, *concurrent)
 	var wg sync.WaitGroup
-	wg.Add(*numPulls)
+	var counter int64 = 0
+	startTime := time.Now()
+
+	// Create a channel for logging
+	logCh := make(chan string, *concurrent)
+
+	// Start logger goroutine
+	go func() {
+		for msg := range logCh {
+			fmt.Println("\r" + msg)
+			fmt.Print("\r" + renderProgressBar(atomic.LoadInt64(&counter), *numPulls, 50))
+		}
+	}()
+
+	// Progress bar goroutine
+	ticker := time.NewTicker(time.Duration(*delay) * time.Millisecond)
+	go func() {
+		for range ticker.C {
+			if atomic.LoadInt64(&counter) >= int64(*numPulls) {
+				return
+			}
+			fmt.Print("\r" + renderProgressBar(atomic.LoadInt64(&counter), *numPulls, 50))
+		}
+	}()
 
 	for i := 0; i < *numPulls; i++ {
-		go simulateManifestPull(registry, *imageName, i+1, &wg)
-		// Add configurable delay between starting connections
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func(id int) {
+			simulateManifestPull(registry, *imageName, id, &wg, &counter, logCh)
+			<-semaphore
+		}(i + 1)
+
 		time.Sleep(time.Duration(*delay) * time.Millisecond)
 	}
 
 	wg.Wait()
-	fmt.Println("All manifest requests completed!")
+	time.Sleep(time.Duration(*delay) * time.Millisecond) // Wait for the last log messages
+	ticker.Stop()
+	close(logCh)
+
+	duration := time.Since(startTime)
+	rate := float64(*numPulls) / duration.Seconds()
+
+	fmt.Printf("\nAll manifest requests completed!\n")
+	fmt.Printf("Time taken: %s\n", duration)
+	fmt.Printf("Average rate: %.1f requests/second\n", rate)
 }
 
 func getRegistryKeys() []string {
