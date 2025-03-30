@@ -224,7 +224,7 @@ func main() {
 		numPulls     = flag.Int("pulls", 1, "Number of pulls to simulate")
 		registryName = flag.String("registry", "dockerhub", "Registry to use (dockerhub, ghcr)")
 		delay        = flag.Int("delay", 50, "Base delay between requests in milliseconds")
-		jitter       = flag.Float64("jitter", 0.0, "Jitter factor for randomizing delays (0.0-100.0)")
+		jitter       = flag.Float64("jitter", 30.0, "Jitter factor for randomizing delays (0.0-100.0)")
 		concurrent   = flag.Int("concurrent", 5, "Number of concurrent requests")
 	)
 	flag.Parse()
